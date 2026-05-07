@@ -336,7 +336,15 @@ class ScheduleBatchSMC:
                         hasattr(self.req_to_token_pool, "free_mamba_cache")
                         and req.mamba_pool_idx is not None
                     ):
+                        saved_idx = req.mamba_pool_idx
                         self.req_to_token_pool.free_mamba_cache(req)
+                        draft_pool = getattr(
+                            self.req_to_token_pool,
+                            "_smc_draft_hybrid_pool",
+                            None,
+                        )
+                        from smcsd.common.utils import _clear_draft_mamba_slot
+                        _clear_draft_mamba_slot(draft_pool, saved_idx)
                     self.req_to_token_pool.free(req)
 
             self.req_pool_indices[slot] = EMPTY_SLOT

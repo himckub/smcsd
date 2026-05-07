@@ -337,7 +337,22 @@ class SMCWorker(BaseSpecWorker):
 
         target_pool = self.req_to_token_pool
         draft_config = self.draft_runner.mambaish_config
+        _smc_debug = bool(os.environ.get("SMCSD_HYBRID_DEBUG"))
+        if _smc_debug:
+            print(
+                f"[SMC HYBRID] tp{self.tp_rank} isolation check: "
+                f"target_has_mamba_pool={hasattr(target_pool, 'mamba_pool')} "
+                f"draft_mambaish_config={draft_config is not None} "
+                f"target_shape={target_shape} draft_shape={draft_shape}",
+                flush=True,
+            )
         if not hasattr(target_pool, "mamba_pool") or draft_config is None:
+            if _smc_debug:
+                print(
+                    f"[SMC HYBRID] tp{self.tp_rank} isolation SKIPPED — "
+                    f"draft uses target's pool",
+                    flush=True,
+                )
             return
 
         draft_pool = HybridReqToTokenPool(
@@ -419,15 +434,25 @@ class SMCWorker(BaseSpecWorker):
                 )
 
         self._dense_draft_hybrid_req_to_token_pool = draft_pool
-        logger.warning(
-            "SMC dense mode isolated hybrid draft state/KV: target=%s shape=%s "
-            "draft=%s shape=%s full_attn_layers=%s",
-            self.score_runner.model_config.model_path,
-            target_shape,
-            self.draft_runner.model_config.model_path,
-            draft_shape,
-            self.draft_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys(),
+        # Backref so the SMC release helpers (_release_internal_req /
+        # _release_smc_parent_req) can free the draft pool's mamba state
+        # alongside the target's. Without this, freed req_pool_idx slots
+        # get re-used by the next request while their draft Mamba state
+        # carries over from the previous occupant — causes accuracy to
+        # degrade monotonically across questions on hybrid+hybrid pairs.
+        target_pool._smc_draft_hybrid_pool = draft_pool
+        msg = (
+            f"SMC dense mode isolated hybrid draft state/KV: "
+            f"target={self.score_runner.model_config.model_path} "
+            f"shape={target_shape} "
+            f"draft={self.draft_runner.model_config.model_path} "
+            f"shape={draft_shape} "
+            f"full_attn_layers="
+            f"{list(self.draft_runner.token_to_kv_pool.full_attention_layer_id_mapping.keys())}"
         )
+        logger.warning(msg)
+        if _smc_debug:
+            print(f"[SMC HYBRID] tp{self.tp_rank} {msg}", flush=True)
 
     @staticmethod
     def _copy_hybrid_state_pairwise(pool, src_req_pool_indices, dst_req_pool_indices):
