@@ -4,7 +4,7 @@ import copy
 import logging
 import signal
 import time
-from collections import Counter, deque
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -23,10 +23,6 @@ from smcsd.common.utils import (
     _release_smc_parent_req,
     clone_req_for_smc_particle,
     compute_smc_shared_prefix_len,
-    multinomial_resample,
-    normalize_log_weights,
-    should_resample,
-    systematic_resample,
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
@@ -35,15 +31,6 @@ from sglang.srt.utils import DynamicGradMode
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class ResampleJobSet:
-    """Per-group dst/src pairs produced by the slow path."""
-
-    group_id: str
-    dst_slots: List[int]
-    src_slots: List[int]
 
 
 def _prepare_req_for_private_prefill(req: Req) -> None:
@@ -127,17 +114,19 @@ class SequenceGroup:
 ### The V1a path (Engine() with SMCManager in scheduler.py) is unchanged.
 
 class SMCCoordinator:
-    """SMC resample coordinator with two paths:
+    """SMC resample coordinator (fused systematic kernel only).
 
-    1. **slow path** (`fast_resample=False`, default): per-group Python
-       normalize + ESS + systematic/multinomial resample + Counter-based
-       dst/src pairing + per-slot `resample_copy_slot`.  Zero fusion — the
-       reference against which the fast path is validated.
-    2. **fast path** (`fast_resample=True`): one fused Triton kernel (see
-       `fused_collect_kernel.py`) emits flat `dst/src/row_of_job` tensors
-       consumed directly by `batched_resample_kv` (fused KV copy) plus a
-       per-pair `copy_req_metadata` Python loop (inherent unavoidable cost).
-       Requires systematic resampling + CUDA.
+    One fused Triton kernel per decode step:
+
+    1. ``collect`` — for every in-use group, normalise interval weights, check
+       ESS against ``threshold * N``, and (if below threshold) run systematic
+       resampling, emitting flat ``dst/src/row_of_job`` tensors.
+    2. ``dispatch`` — hand those flat tensors to ``batched_resample_kv`` (fused
+       KV block-table copy + refcount update) plus a per-pair
+       ``copy_req_metadata`` Python loop (inherent unavoidable cost).
+
+    Only the fused systematic path is supported. The legacy per-group Python
+    "slow" path was removed when the fused kernel became the validated default.
     """
 
     def __init__(
@@ -146,24 +135,21 @@ class SMCCoordinator:
         device: torch.device | str,
         resample_threshold: float,
         resample_method: str,
-        fast_resample: bool = False,
     ) -> None:
+        if resample_method != "systematic":
+            raise ValueError(
+                f"smc_resample_method={resample_method!r} is not supported; "
+                "only 'systematic' is currently implemented."
+            )
+        if torch.device(device).type != "cuda":
+            raise ValueError("SMCCoordinator requires CUDA")
         self.device = device
         self.resample_threshold = resample_threshold
         self.resample_method = resample_method
-        self.fast_resample = fast_resample
         self._fast_step_counter = 0
-        if self.fast_resample:
-            if resample_method != "systematic":
-                raise ValueError(
-                    "fast_resample requires --smc-resample-method=systematic"
-                )
-            if torch.device(device).type != "cuda":
-                raise ValueError("fast_resample requires CUDA")
-        logger.warning(
-            "SMCCoordinator: resample_method=%s fast_resample=%s",
+        logger.info(
+            "SMCCoordinator: resample_method=%s (fused systematic kernel)",
             resample_method,
-            fast_resample,
         )
 
     # ── Public API ──────────────────────────────────────────
@@ -175,13 +161,10 @@ class SMCCoordinator:
     ):
         """Collect resample jobs for all active groups.
 
-        Returns a `BatchedResampleResult` (fast path) or a plain
-        `List[ResampleJobSet]` (slow path).  `dispatch_resample_batch`
-        accepts both.
+        Returns a ``BatchedResampleResult`` consumed by
+        ``dispatch_resample_batch``.
         """
-        if self.fast_resample:
-            return self._collect_fast(slot_state)
-        return self._collect_slow(group_ids, slot_state)
+        return self._collect_fast(slot_state)
 
     def dispatch_resample_batch(
         self,
@@ -190,133 +173,17 @@ class SMCCoordinator:
         *,
         rebuild_active: bool = True,
     ) -> None:
-        """Dispatch a collect plan.  Fast path → fused KV copy; slow path →
-        per-slot `resample_copy_slot`.  No-op on empty plans.
-        """
-        if isinstance(plan, list):
-            if not plan:
-                return
-            self._dispatch_slow(plan, slot_state)
-        else:
-            # BatchedResampleResult
-            if plan.n_jobs == 0:
-                return
-            self._dispatch_fast(plan, slot_state)
+        """Dispatch a collect plan via the fused KV copy. No-op on empty plans."""
+        if plan.n_jobs == 0:
+            return
+        self._dispatch_fast(plan, slot_state)
 
         # Resampling can copy finished ancestors into previously active slots.
         # Caller may defer rebuild to batch with other membership changes.
         if rebuild_active:
             slot_state.rebuild_active_slots()
 
-    # ── Slow path (golden truth) ────────────────────────────
-
-    def _collect_slow(
-        self,
-        group_ids: List[str],
-        slot_state: "ScheduleBatchSMC",
-    ) -> List[ResampleJobSet]:
-        """Per-group Python collection.  Preserves legacy semantics
-        (includes all particles, relies on finished_mask propagation via
-        `resample_copy_slot`).
-        """
-        jobs: List[ResampleJobSet] = []
-        for group_id in group_ids:
-            job = self._collect_one(group_id, slot_state)
-            if job is not None:
-                jobs.append(job)
-        return jobs
-
-    def _collect_one(
-        self,
-        group_id: str,
-        slot_state: "ScheduleBatchSMC",
-    ) -> Optional[ResampleJobSet]:
-        """Single-group Python collect.  Preserves legacy behaviour: all
-        particles (including finished) participate; `finished_mask` is
-        propagated downstream via `resample_copy_slot`.
-        """
-        iw = slot_state.group_interval_weights.get(group_id)
-        if iw is None:
-            return None
-        slots = slot_state.group_slot_lists.get(group_id, [])
-        if len(slots) <= 1:
-            return None
-
-        pidx_gpu = slot_state.particle_indices[slots]
-        resample_pidxs = pidx_gpu.tolist()
-        pidx_to_slot = dict(zip(resample_pidxs, slots))
-
-        normalized_weights = normalize_log_weights(
-            iw[resample_pidxs], device=self.device,
-        )
-        if not should_resample(
-            normalized_weights,
-            len(resample_pidxs),
-            self.resample_threshold,
-            device=self.device,
-        ):
-            return None
-
-        if self.resample_method == "multinomial":
-            ancestors_t = multinomial_resample(normalized_weights, device=self.device)
-        else:
-            ancestors_t = systematic_resample(normalized_weights, device=self.device)
-
-        # Reset cumulative weights (writes through the group_log_weights view
-        # into the stacked storage).
-        pidx_t = pidx_gpu.to(torch.int64)
-        slot_state.group_log_weights[group_id][pidx_t] = 0.0
-        iw[pidx_t] = 0.0
-
-        ancestor_pidxs = [resample_pidxs[idx] for idx in ancestors_t.tolist()]
-
-        keep_counts: Counter[int] = Counter()
-        target_counts = Counter(ancestor_pidxs)
-        dst_pidxs: List[int] = []
-        src_pidxs: List[int] = []
-        for pidx in resample_pidxs:
-            if keep_counts[pidx] < target_counts[pidx]:
-                keep_counts[pidx] += 1
-                continue
-            dst_pidxs.append(pidx)
-        for pidx in resample_pidxs:
-            remaining = target_counts[pidx] - keep_counts[pidx]
-            if remaining > 0:
-                src_pidxs.extend([pidx] * remaining)
-        if not dst_pidxs:
-            return None
-
-        dst_slots = [pidx_to_slot[p] for p in dst_pidxs]
-        src_slots = [pidx_to_slot[p] for p in src_pidxs]
-        return ResampleJobSet(
-            group_id=group_id, dst_slots=dst_slots, src_slots=src_slots,
-        )
-
-    def _dispatch_slow(
-        self,
-        jobs: List[ResampleJobSet],
-        slot_state: "ScheduleBatchSMC",
-    ) -> None:
-        """No-fusion dispatch: per-slot `resample_copy_slot` inside one
-        free_group_begin/end wrapper."""
-        if __debug__:
-            all_dst: set = set()
-            all_src: set = set()
-            for job in jobs:
-                all_dst.update(job.dst_slots)
-                all_src.update(job.src_slots)
-            assert all_dst.isdisjoint(all_src), (
-                "Cross-group dst/src slot overlap detected (slow path)"
-            )
-        slot_state.token_to_kv_pool_allocator.free_group_begin()
-        try:
-            for job in jobs:
-                for dst_slot, src_slot in zip(job.dst_slots, job.src_slots):
-                    slot_state.resample_copy_slot(dst_slot, src_slot)
-        finally:
-            slot_state.token_to_kv_pool_allocator.free_group_end()
-
-    # ── Fast path ───────────────────────────────────────────
+    # ── Fused systematic kernel ─────────────────────────────
 
     def _collect_fast(self, slot_state: "ScheduleBatchSMC"):
         """One fused kernel launch.  Returns `BatchedResampleResult`.
@@ -447,7 +314,6 @@ class SMCScheduler(Scheduler):
             device=self.device,
             resample_threshold=server_args.smc_resample_threshold,
             resample_method=server_args.smc_resample_method,
-            fast_resample=server_args.smc_fast_resample,
         )
         self._group_idx_counter = 0
 
@@ -972,9 +838,7 @@ class SMCScheduler(Scheduler):
             rebuild_active=False,
         )
 
-        # Resample all groups.  Either the slow path (List[ResampleJobSet],
-        # golden truth) or the fast path (BatchedResampleResult, one fused
-        # kernel) depending on `server_args.smc_fast_resample`.
+        # Resample all groups via the fused systematic kernel.
         active_group_ids = [
             group.group_id
             for group in self.running_groups
