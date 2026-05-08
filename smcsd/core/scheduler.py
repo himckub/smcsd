@@ -182,26 +182,17 @@ class SMCCoordinator:
     # ── Fused systematic kernel ─────────────────────────────
 
     def _collect_fast(self, slot_state: "ScheduleBatchSMC"):
-        """One fused kernel launch.  Returns `BatchedResampleResult`.
-
-        Seeds are drawn inside the kernel via Philox (`tl.rand`), keyed by a
-        monotonic host-side step counter so consecutive calls produce
-        independent stratified u ~ U[0,1/n_active) values without any
-        per-step host allocation or device sync.
-        """
+        """One fused kernel launch.  Returns `BatchedResampleResult`."""
         from smcsd.core.kernels.fused_collect import batched_collect_fused
 
-        stacked = slot_state.stacked
         self._fast_step_counter += 1
         return batched_collect_fused(
-            stacked,
+            slot_state.log_weights,
+            slot_state.interval_weights,
+            slot_state.group_to_slots,
+            slot_state.row_in_use,
             self.resample_threshold,
             step_counter=self._fast_step_counter,
-            scratch_dst=stacked.scratch_dst_flat,
-            scratch_src=stacked.scratch_src_flat,
-            scratch_row=stacked.scratch_row_of_job,
-            scratch_counter=stacked.scratch_counter,
-            scratch_mask=stacked.scratch_resample_mask,
         )
 
     def _dispatch_fast(self, plan, slot_state: "ScheduleBatchSMC") -> None:
