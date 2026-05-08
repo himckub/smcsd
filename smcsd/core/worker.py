@@ -82,24 +82,6 @@ class SMCWorker(BaseSpecWorker):
         # hybrid-models-on-main if you want those.
         self._dense_draft_hybrid_req_to_token_pool = None
 
-        # Per-phase timing accumulators (env-gated). Records the time spent in
-        # the draft AR loop, target verify forward, and "other" SMC bookkeeping
-        # (resample, mamba commit, output build) in milliseconds, summed across
-        # decode steps. Set SMCSD_TIMING=1 to enable; print summary every
-        # SMCSD_TIMING_EVERY steps (default 50).
-        self._timing_enabled = bool(os.environ.get("SMCSD_TIMING"))
-        self._timing_every = int(os.environ.get("SMCSD_TIMING_EVERY", "50"))
-        self._t_draft_ms = 0.0
-        self._t_verify_ms = 0.0
-        self._t_other_ms = 0.0
-        self._t_steps = 0
-        if self._timing_enabled:
-            print(
-                f"[SMC TIMING] enabled (every {self._timing_every} steps) "
-                f"on tp_rank={tp_rank}",
-                flush=True,
-            )
-
         # Share req_to_token_pool, separate KV caches
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -506,14 +488,6 @@ class SMCWorker(BaseSpecWorker):
         bs = len(ctx.orig_seq_lens)
         gamma = self.gamma
 
-        # ---- Timing setup (env-gated, dense path only) ----
-        if self._timing_enabled:
-            ev_t0 = torch.cuda.Event(enable_timing=True)
-            ev_draft_end = torch.cuda.Event(enable_timing=True)
-            ev_verify_end = torch.cuda.Event(enable_timing=True)
-            ev_other_end = torch.cuda.Event(enable_timing=True)
-            ev_t0.record()
-
         # ---- 2. Dense draft AR: gamma+1 decode steps ----
         use_multistep = (
             self.draft_attn_backend is not None
@@ -570,9 +544,6 @@ class SMCWorker(BaseSpecWorker):
 
         draft_logprobs_stacked = torch.stack(draft_logprobs, dim=1)
 
-        if self._timing_enabled:
-            ev_draft_end.record()
-
         # ---- 3. Score verify ----
         verify_forward_batch, can_run_cuda_graph = ctx.prepare_for_verify(
             self.req_to_token_pool,
@@ -596,9 +567,6 @@ class SMCWorker(BaseSpecWorker):
             self._commit_target_mamba_state_after_verify(
                 verify_forward_batch, accepted_steps
             )
-
-        if self._timing_enabled:
-            ev_verify_end.record()
 
         # ---- 4. Extract score logprobs ----
         score_logits = score_result.logits_output.next_token_logits
@@ -646,24 +614,6 @@ class SMCWorker(BaseSpecWorker):
             logprob_diff=logprob_diff,
             num_tokens_per_req=self.speculative_num_draft_tokens,
         )
-
-        if self._timing_enabled:
-            ev_other_end.record()
-            ev_other_end.synchronize()
-            self._t_draft_ms += ev_t0.elapsed_time(ev_draft_end)
-            self._t_verify_ms += ev_draft_end.elapsed_time(ev_verify_end)
-            self._t_other_ms += ev_verify_end.elapsed_time(ev_other_end)
-            self._t_steps += 1
-            if self._t_steps % self._timing_every == 0:
-                tot = self._t_draft_ms + self._t_verify_ms + self._t_other_ms
-                print(
-                    f"[SMC TIMING] tp{self.tp_rank} steps={self._t_steps} "
-                    f"draft={self._t_draft_ms:.0f}ms ({100 * self._t_draft_ms / max(tot, 1e-6):.1f}%) "
-                    f"verify={self._t_verify_ms:.0f}ms ({100 * self._t_verify_ms / max(tot, 1e-6):.1f}%) "
-                    f"other={self._t_other_ms:.0f}ms ({100 * self._t_other_ms / max(tot, 1e-6):.1f}%) "
-                    f"avg/step={tot / self._t_steps:.1f}ms",
-                    flush=True,
-                )
 
         return GenerationBatchResult(
             logits_output=score_result.logits_output,
