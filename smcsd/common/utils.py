@@ -62,6 +62,75 @@ def _clear_draft_mamba_slot(draft_pool, slot_idx) -> None:
     mamba_pool.free_slots = torch.cat((mamba_pool.free_slots, slot_t))
 
 
+def _copy_hybrid_mamba_state_pairwise(
+    pool, src_req_pool_indices: torch.Tensor, dst_req_pool_indices: torch.Tensor,
+) -> None:
+    """Copy Mamba recurrent state src→dst on a single pool, indexed by
+    req_pool_idx. No-op when the pool has no mamba state or there are no
+    pairs to copy."""
+    if pool is None or not hasattr(pool, "mamba_pool"):
+        return
+    if src_req_pool_indices.numel() == 0:
+        return
+    mapping = pool.req_index_to_mamba_index_mapping
+    src_mamba = mapping[src_req_pool_indices.to(torch.long)].to(torch.long)
+    dst_mamba = mapping[dst_req_pool_indices.to(torch.long)].to(torch.long)
+    pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+
+
+def fanout_smc_parent_hybrid_state(
+    *,
+    target_pool,
+    draft_pool,
+    parent_req: Req,
+    particle_reqs: List[Req],
+    device: torch.device | str,
+) -> None:
+    """Copy hybrid recurrent state from the prefilled parent to particles
+    on both the target and (optional) draft pools."""
+    if parent_req.req_pool_idx is None or not particle_reqs:
+        return
+    dst = torch.tensor(
+        [req.req_pool_idx for req in particle_reqs],
+        dtype=torch.long,
+        device=device,
+    )
+    src = torch.full_like(dst, int(parent_req.req_pool_idx))
+    _copy_hybrid_mamba_state_pairwise(target_pool, src, dst)
+    _copy_hybrid_mamba_state_pairwise(draft_pool, src, dst)
+
+
+def copy_smc_resampled_hybrid_state(
+    *,
+    target_pool,
+    draft_pool,
+    slot_state,
+    plan,
+    device: torch.device | str,
+) -> None:
+    """Copy hybrid recurrent state after SMC resampling clones particles."""
+    if isinstance(plan, list):
+        dst_slots: List[int] = []
+        src_slots: List[int] = []
+        for job in plan:
+            dst_slots.extend(job.dst_slots)
+            src_slots.extend(job.src_slots)
+        if not dst_slots:
+            return
+        dst_slots_t = torch.tensor(dst_slots, dtype=torch.long, device=device)
+        src_slots_t = torch.tensor(src_slots, dtype=torch.long, device=device)
+    else:
+        if plan.n_jobs == 0:
+            return
+        dst_slots_t = plan.dst_slots.to(torch.long)
+        src_slots_t = plan.src_slots.to(torch.long)
+
+    dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
+    src_req_pool = slot_state.req_pool_indices[src_slots_t]
+    _copy_hybrid_mamba_state_pairwise(target_pool, src_req_pool, dst_req_pool)
+    _copy_hybrid_mamba_state_pairwise(draft_pool, src_req_pool, dst_req_pool)
+
+
 def validate_smc_parent_req(req: Req) -> Optional[str]:
     if req.__dict__.get("multimodal_inputs") is not None:
         return "SMC speculative decoding does not yet support multimodal inputs."

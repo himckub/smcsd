@@ -316,59 +316,6 @@ class SMCWorker(BaseSpecWorker):
         if _smc_debug:
             print(f"[SMC HYBRID] tp{self.tp_rank} {msg}", flush=True)
 
-    @staticmethod
-    def _copy_hybrid_state_pairwise(pool, src_req_pool_indices, dst_req_pool_indices):
-        if pool is None or not hasattr(pool, "mamba_pool"):
-            return
-        if src_req_pool_indices.numel() == 0:
-            return
-        mapping = pool.req_index_to_mamba_index_mapping
-        src_mamba = mapping[src_req_pool_indices.to(torch.long)].to(torch.long)
-        dst_mamba = mapping[dst_req_pool_indices.to(torch.long)].to(torch.long)
-        pool.mamba_pool.copy_from(src_mamba, dst_mamba)
-
-    def fanout_smc_parent_hybrid_state(self, parent_req, particle_reqs) -> None:
-        """Copy hybrid recurrent state from the prefilled parent to particles."""
-        if parent_req.req_pool_idx is None or not particle_reqs:
-            return
-        dst = torch.tensor(
-            [req.req_pool_idx for req in particle_reqs],
-            dtype=torch.long,
-            device=self.device,
-        )
-        src = torch.full_like(dst, int(parent_req.req_pool_idx))
-        self._copy_hybrid_state_pairwise(self.req_to_token_pool, src, dst)
-        self._copy_hybrid_state_pairwise(
-            self._dense_draft_hybrid_req_to_token_pool, src, dst
-        )
-
-    def copy_smc_resampled_hybrid_state(self, slot_state, plan) -> None:
-        """Copy hybrid recurrent state after SMC resampling clones particles."""
-        if isinstance(plan, list):
-            dst_slots = []
-            src_slots = []
-            for job in plan:
-                dst_slots.extend(job.dst_slots)
-                src_slots.extend(job.src_slots)
-            if not dst_slots:
-                return
-            dst_slots_t = torch.tensor(dst_slots, dtype=torch.long, device=self.device)
-            src_slots_t = torch.tensor(src_slots, dtype=torch.long, device=self.device)
-        else:
-            if plan.n_jobs == 0:
-                return
-            dst_slots_t = plan.dst_slots.to(torch.long)
-            src_slots_t = plan.src_slots.to(torch.long)
-
-        dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
-        src_req_pool = slot_state.req_pool_indices[src_slots_t]
-        self._copy_hybrid_state_pairwise(
-            self.req_to_token_pool, src_req_pool, dst_req_pool
-        )
-        self._copy_hybrid_state_pairwise(
-            self._dense_draft_hybrid_req_to_token_pool, src_req_pool, dst_req_pool
-        )
-
     def _commit_target_mamba_state_after_verify(
         self,
         verify_forward_batch: ForwardBatch,

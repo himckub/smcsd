@@ -23,6 +23,8 @@ from smcsd.common.utils import (
     _release_smc_parent_req,
     clone_req_for_smc_particle,
     compute_smc_shared_prefix_len,
+    copy_smc_resampled_hybrid_state,
+    fanout_smc_parent_hybrid_state,
     validate_smc_parent_req,
 )
 from smcsd.mem_cache.allocator import copy_block_table
@@ -628,8 +630,16 @@ class SMCScheduler(Scheduler):
                     particle_req.req_pool_idx, :shared_seq_len
                 ].to(dtype=torch.int64, copy=True)
                 particle_req.cache_protected_len = shared_seq_len
-            self.model_worker.fanout_smc_parent_hybrid_state(
-                parent_req, particle_reqs
+            fanout_smc_parent_hybrid_state(
+                target_pool=self.req_to_token_pool,
+                draft_pool=getattr(
+                    self.model_worker,
+                    "_dense_draft_hybrid_req_to_token_pool",
+                    None,
+                ),
+                parent_req=parent_req,
+                particle_reqs=particle_reqs,
+                device=self.device,
             )
         except Exception as exc:
             for particle_req in particle_reqs:
@@ -741,8 +751,16 @@ class SMCScheduler(Scheduler):
             self.coordinator.dispatch_resample_batch(
                 plan, self.slot_state, rebuild_active=False,
             )
-            self.model_worker.copy_smc_resampled_hybrid_state(
-                self.slot_state, plan
+            copy_smc_resampled_hybrid_state(
+                target_pool=self.req_to_token_pool,
+                draft_pool=getattr(
+                    self.model_worker,
+                    "_dense_draft_hybrid_req_to_token_pool",
+                    None,
+                ),
+                slot_state=self.slot_state,
+                plan=plan,
+                device=self.device,
             )
 
         # Single rebuild per decode cycle if membership changed
