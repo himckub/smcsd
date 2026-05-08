@@ -109,10 +109,6 @@ class SequenceGroup:
         self.interval_log_weights = None
 
 
-### V1b dedicated scheduler classes (ScheduleGroupBatch, SMCCoordinator, SMCScheduler,
-### run_smc_scheduler_process) have been removed. See git history for the old code.
-### The V1a path (Engine() with SMCManager in scheduler.py) is unchanged.
-
 class SMCCoordinator:
     """SMC resample coordinator (fused systematic kernel only).
 

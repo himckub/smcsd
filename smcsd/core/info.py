@@ -42,9 +42,6 @@ if TYPE_CHECKING:
 class SMCDecodeContext:
     """Per-decode-cycle state computed during prepare_for_decode (scheduler side),
     consumed by prepare_for_draft / prepare_for_verify (worker side).
-
-    This replaces the hidden _orig_seq_lens / _orig_seq_lens_cpu / _orig_seq_lens_sum
-    state that was stashed on SMCDraftInput in the v1 API.
     """
 
     orig_seq_lens: torch.Tensor  # (bs,) committed prefix BEFORE advance
@@ -254,8 +251,8 @@ class SMCDecodeContext:
 class SMCDraftInput(SpecInput):
     """Lightweight carrier between scheduler and worker via batch.spec_info.
 
-    Unlike v1 SMCDraftInput, this has NO prepare_for_decode / prepare_for_draft /
-    prepare_for_verify methods. Those live on SMCDecodeContext.
+    Has no prepare_for_decode / prepare_for_draft / prepare_for_verify methods —
+    those live on SMCDecodeContext.
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token

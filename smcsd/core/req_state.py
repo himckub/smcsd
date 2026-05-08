@@ -192,8 +192,8 @@ class ScheduleBatchSMC:
             self.ignore_eos_t[slot] = bool(req.sampling_params.ignore_eos)
             self.max_new_tokens_t[slot] = req.sampling_params.max_new_tokens
 
-            # EOS token ids — collect from all sources matching v1's check_finished:
-            # req.eos_token_ids, sampling_params.stop_token_ids, tokenizer EOS
+            # EOS token ids: gather from req.eos_token_ids, sampling_params
+            # stop_token_ids, and the tokenizer EOS.
             eos_ids = list(req.eos_token_ids or [])
             if req.sampling_params.stop_token_ids:
                 eos_ids.extend(req.sampling_params.stop_token_ids)
@@ -487,8 +487,7 @@ class ScheduleBatchSMC:
         length_hit = updated_counts >= max_tokens
 
         # EOS check: compare each accepted token against per-slot EOS ids.
-        # Suppressed for slots with ignore_eos=True (matches v1's
-        # _check_token_based_finish which skips all token-based checks).
+        # Suppressed for slots with ignore_eos=True.
         eos_ids = self.eos_token_ids_t[active]  # (bs, max_eos_count)
         eos_hit = (
             accepted_2d.unsqueeze(2).to(torch.int64)
@@ -535,7 +534,7 @@ class ScheduleBatchSMC:
                             break
                     req.finished_reason = FINISH_MATCHED_TOKEN(matched=matched_tok)
                     # finished_len = tokens before this stride + EOS position + 1
-                    # (matches v1: output_ids[:finished_len] includes EOS, excludes post-EOS)
+                    # (output_ids[:finished_len] includes EOS, excludes post-EOS)
                     old_count = count - stride
                     req.finished_len = old_count + eos_pos_in_stride + 1
                 # Set output_ids truncated at finished_len (excludes post-EOS tokens)
