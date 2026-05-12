@@ -17,6 +17,109 @@ if TYPE_CHECKING:
 SMC_MIN_TEMPERATURE = 1e-5
 
 
+def _clear_draft_mamba_slot(draft_pool, slot_idx) -> None:
+    """Zero out the draft pool's mamba state at ``slot_idx`` and return the
+    slot to its free_slots list.
+
+    Required because the SMC-isolated draft pool uses identity mapping
+    (``req_pool_idx == mamba_idx``), bypassing ``MambaPool.alloc`` whose
+    side effect is to zero state at allocation time. Without an explicit
+    clear here, the draft Mamba state from a finished request leaks into
+    whatever request next inherits the same ``req_pool_idx`` — observed as
+    monotonically degrading accuracy across questions on hybrid+hybrid
+    pairs (worst on the bigger draft, e.g. Qwen3.5-9B as draft for
+    Qwen3.6-27B target).
+    """
+    if draft_pool is None or slot_idx is None:
+        return
+    mamba_pool = getattr(draft_pool, "mamba_pool", None)
+    if mamba_pool is None:
+        return
+    if isinstance(slot_idx, torch.Tensor):
+        slot_t = slot_idx.to(torch.int64).reshape(-1)
+    else:
+        slot_t = torch.tensor(
+            [int(slot_idx)], dtype=torch.int64, device=mamba_pool.free_slots.device,
+        )
+    if slot_t.numel() == 0:
+        return
+    n = slot_t.numel()
+    cache = mamba_pool.mamba_cache
+    for i in range(len(cache.conv)):
+        t = cache.conv[i]
+        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+            t.shape[0], n, *t.shape[2:]
+        )
+        t[:, slot_t] = z
+    t = cache.temporal
+    z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
+        t.shape[0], n, *t.shape[2:]
+    )
+    t[:, slot_t] = z
+    # Return the slot to the draft pool's free_slots so bookkeeping stays
+    # consistent (even though identity mapping bypasses alloc, double-free
+    # asserts read this list).
+    mamba_pool.free_slots = torch.cat((mamba_pool.free_slots, slot_t))
+
+
+def _copy_hybrid_mamba_state_pairwise(
+    pool, src_req_pool_indices: torch.Tensor, dst_req_pool_indices: torch.Tensor,
+) -> None:
+    """Copy Mamba recurrent state src→dst on a single pool, indexed by
+    req_pool_idx. No-op when the pool has no mamba state or there are no
+    pairs to copy."""
+    if pool is None or not hasattr(pool, "mamba_pool"):
+        return
+    if src_req_pool_indices.numel() == 0:
+        return
+    mapping = pool.req_index_to_mamba_index_mapping
+    src_mamba = mapping[src_req_pool_indices.to(torch.long)].to(torch.long)
+    dst_mamba = mapping[dst_req_pool_indices.to(torch.long)].to(torch.long)
+    pool.mamba_pool.copy_from(src_mamba, dst_mamba)
+
+
+def fanout_smc_parent_hybrid_state(
+    *,
+    target_pool,
+    draft_pool,
+    parent_req: Req,
+    particle_reqs: List[Req],
+    device: torch.device | str,
+) -> None:
+    """Copy hybrid recurrent state from the prefilled parent to particles
+    on both the target and (optional) draft pools."""
+    if parent_req.req_pool_idx is None or not particle_reqs:
+        return
+    dst = torch.tensor(
+        [req.req_pool_idx for req in particle_reqs],
+        dtype=torch.long,
+        device=device,
+    )
+    src = torch.full_like(dst, int(parent_req.req_pool_idx))
+    _copy_hybrid_mamba_state_pairwise(target_pool, src, dst)
+    _copy_hybrid_mamba_state_pairwise(draft_pool, src, dst)
+
+
+def copy_smc_resampled_hybrid_state(
+    *,
+    target_pool,
+    draft_pool,
+    slot_state,
+    plan,
+    device: torch.device | str,
+) -> None:
+    """Copy hybrid recurrent state after SMC resampling clones particles."""
+    if plan.n_jobs == 0:
+        return
+    dst_slots_t = plan.dst_slots.to(torch.long)
+    src_slots_t = plan.src_slots.to(torch.long)
+
+    dst_req_pool = slot_state.req_pool_indices[dst_slots_t]
+    src_req_pool = slot_state.req_pool_indices[src_slots_t]
+    _copy_hybrid_mamba_state_pairwise(target_pool, src_req_pool, dst_req_pool)
+    _copy_hybrid_mamba_state_pairwise(draft_pool, src_req_pool, dst_req_pool)
+
+
 def validate_smc_parent_req(req: Req) -> Optional[str]:
     if req.__dict__.get("multimodal_inputs") is not None:
         return "SMC speculative decoding does not yet support multimodal inputs."
@@ -128,6 +231,16 @@ def _release_internal_req(
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(indices)
 
+    if (
+        hasattr(req_to_token_pool, "free_mamba_cache")
+        and req.mamba_pool_idx is not None
+    ):
+        saved_idx = req.mamba_pool_idx
+        req_to_token_pool.free_mamba_cache(req)
+        # Clear the SMC-isolated draft pool's mamba state at the same slot
+        # (identity-mapped). See _clear_draft_mamba_slot docstring.
+        draft_pool = getattr(req_to_token_pool, "_smc_draft_hybrid_pool", None)
+        _clear_draft_mamba_slot(draft_pool, saved_idx)
     req_to_token_pool.free(req)
     req.prefix_indices = _empty_prefix_indices()
     req.kv_committed_len = 0
@@ -168,6 +281,14 @@ def _release_smc_parent_req(
         ].to(dtype=torch.int64, copy=True)
         token_to_kv_pool_allocator.dec_ref_and_free(overalloc_indices)
 
+    if (
+        hasattr(req_to_token_pool, "free_mamba_cache")
+        and req.mamba_pool_idx is not None
+    ):
+        saved_idx = req.mamba_pool_idx
+        req_to_token_pool.free_mamba_cache(req)
+        draft_pool = getattr(req_to_token_pool, "_smc_draft_hybrid_pool", None)
+        _clear_draft_mamba_slot(draft_pool, saved_idx)
     req_to_token_pool.free(req)
     if req.last_node is not None:
         tree_cache.dec_lock_ref(req.last_node)

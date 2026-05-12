@@ -1,10 +1,10 @@
 """SMC spec info: clean separation of concerns.
 
 - SMCDecodeContext: per-cycle state created by scheduler, consumed by worker.
-  Owns prepare_for_draft / prepare_for_verify.  Factory method
-  ``from_slot_gather`` does vectorised KV allocation.
+  Owns prepare_for_draft / prepare_for_verify.
+  Factory method from_slot_gather does vectorized KV allocation.
 
-- SMCDraftInput: pure data carrier on ``batch.spec_info`` (no prepare methods).
+- SMCDraftInput: pure data carrier on batch.spec_info (no prepare methods).
 
 - SMCVerifyInput: reused from smc_info.py (unchanged).
 """
@@ -173,6 +173,7 @@ class SMCDecodeContext:
         target_worker: "TpModelWorker",
         all_tokens: list,
         cache_locs: torch.Tensor,
+        capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL,
     ) -> Tuple[ForwardBatch, bool]:
         """Prepare batch and create ForwardBatch for score model verification.
 
@@ -197,7 +198,7 @@ class SMCDecodeContext:
         verify_spec_info = SMCVerifyInput(
             draft_token_num=draft_token_num,
             positions=positions,
-            capture_hidden_mode=CaptureHiddenMode.NULL,
+            capture_hidden_mode=capture_hidden_mode,
             seq_lens_sum=self.orig_seq_lens_sum,
             seq_lens_cpu=orig_seq_lens_cpu,
             num_tokens_per_req=draft_token_num,
@@ -210,7 +211,7 @@ class SMCDecodeContext:
         verify_batch.seq_lens_cpu = orig_seq_lens_cpu
         verify_batch.seq_lens_sum = verify_spec_info.seq_lens_sum
         verify_batch.spec_info = verify_spec_info
-        verify_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        verify_batch.capture_hidden_mode = capture_hidden_mode
         batch = verify_batch
 
         is_idle = batch.forward_mode.is_idle()
@@ -248,9 +249,10 @@ class SMCDecodeContext:
 
 @dataclass
 class SMCDraftInput(SpecInput):
-    """Lightweight carrier between scheduler and worker via ``batch.spec_info``.
+    """Lightweight carrier between scheduler and worker via batch.spec_info.
 
-    Has no prepare_* methods — those live on ``SMCDecodeContext``.
+    Has no prepare_for_decode / prepare_for_draft / prepare_for_verify methods —
+    those live on SMCDecodeContext.
     """
 
     verified_id: Optional[torch.Tensor] = None  # (bs,) last accepted token
