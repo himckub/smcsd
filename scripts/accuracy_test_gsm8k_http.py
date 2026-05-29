@@ -31,7 +31,7 @@ Usage::
     python scripts/accuracy_test_gsm8k_http.py --base-url http://127.0.0.1:30000
 
 On shared machines you typically need ``CUDA_HOME`` set and a fresh
-``FLASHINFER_WORKSPACE_BASE`` (see scripts/health_check_smc.py / README).
+``FLASHINFER_WORKSPACE_BASE`` (see scripts/README.md).
 """
 
 import argparse

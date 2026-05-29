@@ -79,6 +79,11 @@ by `(N+1)` internally (each group needs N+1 Req slots). Keep it modest relative 
 `--mem-fraction-static` — CUDA-graph capture scales with the expanded value and can
 OOM if set too high.
 
+`--mem-fraction-static` defaults to `0.4` for SMC (not sglang's ~0.88): the server
+runs two model runners (target + draft), each sizing its own KV-cache pool, so the
+fraction is effectively counted twice and a larger value OOMs at draft KV-pool init
+on a single GPU. Raise it only if you have headroom.
+
 ### GSM8K over HTTP
 
 ```bash
@@ -114,29 +119,6 @@ source .venv/bin/activate
 python scripts/quick_quality_check.py --model-path meta-llama/Llama-3.1-8B-Instruct \
   --draft-model-path meta-llama/Llama-3.2-1B-Instruct --mode smc
 ```
-
-## SMC Health Check
-
-`scripts/health_check_smc.py` verifies that `quick_quality_check.py` is
-runnable in SMC mode (it drives the current `SMCEngine` API). Two tiers,
-exit code 0 = healthy / non-zero = broken:
-
-```bash
-source .venv/bin/activate
-
-# Tier 1 — smoke (no GPU, seconds): asserts run_smc() wires SMCEngine, not the
-# removed sgl.Engine(speculative_algorithm="SMC") path.
-python scripts/health_check_smc.py
-
-# Tier 2 — add a real GPU generation (loads 8B + 1B):
-python scripts/health_check_smc.py --e2e
-```
-
-The `--e2e` preflight self-heals two common, non-code environment problems
-(non-destructively; user-set values are respected): it points `CUDA_HOME` at a
-valid CUDA toolkit if unset, and redirects the flashinfer JIT cache via
-`FLASHINFER_WORKSPACE_BASE` when the shared `~/.cache/flashinfer` is stale
-(e.g. a `build.ninja` pinned to a CUDA toolkit that no longer exists).
 
 ## Profiling
 

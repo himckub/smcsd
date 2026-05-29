@@ -50,6 +50,11 @@ from smcsd.core.scheduler import run_smc_scheduler_process
 
 logger = logging.getLogger(__name__)
 
+# SMC runs two model runners (target + draft), each sizing its own KV-cache pool
+# from mem_fraction_static, so the usable fraction per runner is ~halved. This is
+# the dual-runner-safe default the offline SMC scripts use; override per model size.
+DEFAULT_MEM_FRACTION_STATIC = 0.4
+
 
 def build_smc_server_args(
     model_path: str,
@@ -84,6 +89,14 @@ def build_smc_server_args(
 
     # SMC requires the triton or fa3 attention backend; default to triton.
     kwargs.setdefault("attention_backend", "triton")
+
+    # SMC loads two independent model runners (target + draft) and each sizes
+    # its own KV-cache pool from mem_fraction_static, so the fraction is counted
+    # roughly twice. sglang's ~0.88 default makes the target grab almost all VRAM,
+    # then the draft KV-pool init OOMs on a single GPU. Default to the same
+    # dual-runner-safe fraction the offline SMC scripts use; an explicit
+    # --mem-fraction-static still overrides it.
+    kwargs.setdefault("mem_fraction_static", DEFAULT_MEM_FRACTION_STATIC)
 
     forced = dict(
         model_path=model_path,
@@ -143,7 +156,13 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tp-size", type=int, default=1)
-    parser.add_argument("--mem-fraction-static", type=float, default=None)
+    parser.add_argument(
+        "--mem-fraction-static",
+        type=float,
+        default=None,
+        help=f"GPU memory fraction. Defaults to {DEFAULT_MEM_FRACTION_STATIC} "
+        "(SMC runs target+draft runners, each with its own KV pool).",
+    )
     parser.add_argument(
         "--attention-backend", default="triton", choices=["triton", "fa3"]
     )
