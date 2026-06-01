@@ -96,7 +96,7 @@ def load_gsm8k(tokenizer, num_questions: int):
         )
         prompts.append(prompt)
         labels.append(extract_answer(sample["answer"]))
-    assert all(l is not None for l in labels), "Some gold labels could not be parsed"
+    assert all(label is not None for label in labels), "Some gold labels could not be parsed"
     return prompts, labels
 
 
@@ -247,7 +247,11 @@ def run_gsm8k(base_url, prompts, labels, args):
                     samples[i] = (0, f"<request failed: {e}>")
             done += 1
             elapsed = time.perf_counter() - tic
-            correct = sum(p == l for p, l in zip(preds, labels) if p is not None)
+            correct = sum(
+                pred == label
+                for pred, label in zip(preds, labels)
+                if pred is not None
+            )
             print(
                 f"\r[{done}/{n}] acc={correct}/{done} ({correct / done:.1%}) "
                 f"tps={sum(ntoks) / elapsed:.0f} elapsed={elapsed:.0f}s",
@@ -260,7 +264,7 @@ def run_gsm8k(base_url, prompts, labels, args):
         nt, text = samples[i]
         print(f"\n--- Q{i} ({nt} tokens) ---\n{text[:400]}")
 
-    correct = sum(p == l for p, l in zip(preds, labels))
+    correct = sum(pred == label for pred, label in zip(preds, labels))
     invalid = sum(p is None for p in preds)
     total_tokens = sum(ntoks)
     return {
